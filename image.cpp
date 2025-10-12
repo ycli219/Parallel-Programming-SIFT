@@ -21,6 +21,7 @@ Image::Image(std::string file_path)
 
     size = width * height * channels;
     data = new float[size]; 
+    #pragma omp parallel for collapse(3)
     for (int x = 0; x < width; x++) {
         for (int y = 0; y < height; y++) {
             for (int c = 0; c < channels; c++) {
@@ -159,6 +160,7 @@ float Image::get_pixel(int x, int y, int c) const
 void Image::clamp()
 {
     int size = width * height * channels;
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < size; i++) {
         float val = data[i];
         val = (val > 1.0) ? 1.0 : val;
@@ -179,6 +181,7 @@ Image Image::resize(int new_w, int new_h, Interpolation method) const
 {
     Image resized(new_w, new_h, this->channels);
     float value = 0;
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int x = 0; x < new_w; x++) {
         for (int y = 0; y < new_h; y++) {
             for (int c = 0; c < resized.channels; c++) {
@@ -218,6 +221,8 @@ Image rgb_to_grayscale(const Image& img)
 {
     assert(img.channels == 3);
     Image gray(img.width, img.height, 1);
+
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int x = 0; x < img.width; x++) {
         for (int y = 0; y < img.height; y++) {
             float red, green, blue;
@@ -234,6 +239,8 @@ Image grayscale_to_rgb(const Image& img)
 {
     assert(img.channels == 1);
     Image rgb(img.width, img.height, 3);
+
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int x = 0; x < img.width; x++) {
         for (int y = 0; y < img.height; y++) {
             float gray_val = img.get_pixel(x, y, 0);
