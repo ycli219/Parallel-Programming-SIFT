@@ -7,11 +7,192 @@
 #include <tuple>
 #include <cassert>
 #include <mpi.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 
 #include "sift.hpp"
 #include "image.hpp"
 
+namespace {
+struct PackedKeypoint {
+    int i;
+    int j;
+    int octave;
+    int scale;
+    float x;
+    float y;
+    float sigma;
+    float extremum_val;
+    uint8_t descriptor[128];
+};
+
+PackedKeypoint pack_keypoint(const Keypoint& kp)
+{
+    PackedKeypoint pkp{};
+    pkp.i = kp.i;
+    pkp.j = kp.j;
+    pkp.octave = kp.octave;
+    pkp.scale = kp.scale;
+    pkp.x = kp.x;
+    pkp.y = kp.y;
+    pkp.sigma = kp.sigma;
+    pkp.extremum_val = kp.extremum_val;
+    std::copy(kp.descriptor.begin(), kp.descriptor.end(), pkp.descriptor);
+    return pkp;
+}
+
+Keypoint unpack_keypoint(const PackedKeypoint& pkp)
+{
+    Keypoint kp{};
+    kp.i = pkp.i;
+    kp.j = pkp.j;
+    kp.octave = pkp.octave;
+    kp.scale = pkp.scale;
+    kp.x = pkp.x;
+    kp.y = pkp.y;
+    kp.sigma = pkp.sigma;
+    kp.extremum_val = pkp.extremum_val;
+    std::copy(std::begin(pkp.descriptor), std::end(pkp.descriptor), kp.descriptor.begin());
+    return kp;
+}
+
+void compute_partition_bounds(int width, int rank, int size, int& begin, int& end)
+{
+    if (width <= 2) {
+        begin = 1;
+        end = 1;
+        return;
+    }
+    if (size <= 1) {
+        begin = 1;
+        end = width - 1;
+        return;
+    }
+    int columns = width - 2;
+    if (columns <= 0) {
+        begin = 1;
+        end = 1;
+        return;
+    }
+    int base = columns / size;
+    int extra = columns % size;
+    int local = base + (rank < extra ? 1 : 0);
+    int offset = base * rank + std::min(rank, extra);
+    begin = 1 + offset;
+    end = begin + local;
+    if (begin >= width - 1) {
+        begin = width - 1;
+    }
+    if (end > width - 1) {
+        end = width - 1;
+    }
+    if (begin > end) {
+        begin = end;
+    }
+}
+
+void broadcast_pyramid(ScaleSpacePyramid& pyramid, int root, MPI_Comm comm)
+{
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+
+    int header[2];
+    if (rank == root) {
+        header[0] = pyramid.num_octaves;
+        header[1] = pyramid.imgs_per_octave;
+    }
+    MPI_Bcast(header, 2, MPI_INT, root, comm);
+
+    if (rank != root) {
+        pyramid.num_octaves = header[0];
+        pyramid.imgs_per_octave = header[1];
+        pyramid.octaves.assign(pyramid.num_octaves,
+                               std::vector<Image>(pyramid.imgs_per_octave));
+    } else {
+        if ((int)pyramid.octaves.size() != pyramid.num_octaves) {
+            pyramid.octaves.resize(pyramid.num_octaves);
+        }
+        for (auto& octave : pyramid.octaves) {
+            if ((int)octave.size() != pyramid.imgs_per_octave) {
+                octave.resize(pyramid.imgs_per_octave);
+            }
+        }
+    }
+
+    for (int i = 0; i < pyramid.num_octaves; ++i) {
+        for (int j = 0; j < pyramid.imgs_per_octave; ++j) {
+            int meta[3];
+            if (rank == root) {
+                meta[0] = pyramid.octaves[i][j].width;
+                meta[1] = pyramid.octaves[i][j].height;
+                meta[2] = pyramid.octaves[i][j].channels;
+            }
+            MPI_Bcast(meta, 3, MPI_INT, root, comm);
+            if (rank != root) {
+                pyramid.octaves[i][j] = Image(meta[0], meta[1], meta[2]);
+            }
+            int total = meta[0] * meta[1] * meta[2];
+            if (total > 0) {
+                MPI_Bcast(pyramid.octaves[i][j].data, total, MPI_FLOAT, root, comm);
+            }
+        }
+    }
+}
+
+std::vector<Keypoint> compute_keypoints_from_pyramids(const ScaleSpacePyramid& dog_pyramid,
+                                                      const ScaleSpacePyramid& grad_pyramid,
+                                                      float contrast_thresh, float edge_thresh,
+                                                      float lambda_ori, float lambda_desc,
+                                                      int world_rank, int world_size)
+{
+    std::vector<Keypoint> tmp_kps = find_keypoints(dog_pyramid, contrast_thresh,
+                                                   edge_thresh, world_rank, world_size);
+#ifdef _OPENMP
+    int thread_count = omp_get_max_threads();
+    std::vector<std::vector<Keypoint>> thread_keypoints(thread_count);
+    const int kp_count = static_cast<int>(tmp_kps.size());
+#pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        std::vector<Keypoint>& local = thread_keypoints[tid];
+#pragma omp for schedule(dynamic, 4)
+        for (int idx = 0; idx < kp_count; ++idx) {
+            Keypoint kp_seed = tmp_kps[idx];
+            std::vector<float> orientations = find_keypoint_orientations(kp_seed, grad_pyramid,
+                                                                         lambda_ori, lambda_desc);
+            for (float theta : orientations) {
+                Keypoint kp = kp_seed;
+                compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
+                local.push_back(kp);
+            }
+        }
+    }
+    size_t total = 0;
+    for (const auto& vec : thread_keypoints) {
+        total += vec.size();
+    }
+    std::vector<Keypoint> kps;
+    kps.reserve(total);
+    for (auto& vec : thread_keypoints) {
+        kps.insert(kps.end(), vec.begin(), vec.end());
+    }
+    return kps;
+#else
+    std::vector<Keypoint> kps;
+    for (Keypoint& kp_tmp : tmp_kps) {
+        std::vector<float> orientations = find_keypoint_orientations(kp_tmp, grad_pyramid,
+                                                                     lambda_ori, lambda_desc);
+        for (float theta : orientations) {
+            Keypoint kp = kp_tmp;
+            compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
+            kps.push_back(kp);
+        }
+    }
+    return kps;
+#endif
+}
+}
 
 
 ScaleSpacePyramid generate_gaussian_pyramid(const Image& img, float sigma_min,
@@ -65,19 +246,17 @@ ScaleSpacePyramid generate_dog_pyramid(const ScaleSpacePyramid& img_pyramid)
         img_pyramid.imgs_per_octave - 1,
         std::vector<std::vector<Image>>(img_pyramid.num_octaves)
     };
-
     for (int i = 0; i < dog_pyramid.num_octaves; i++) {
-        dog_pyramid.octaves[i].resize(dog_pyramid.imgs_per_octave);
-    }
-
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int i = 0; i < dog_pyramid.num_octaves; i++) {
+        dog_pyramid.octaves[i].reserve(dog_pyramid.imgs_per_octave);
         for (int j = 1; j < img_pyramid.imgs_per_octave; j++) {
             Image diff = img_pyramid.octaves[i][j];
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
             for (int pix_idx = 0; pix_idx < diff.size; pix_idx++) {
                 diff.data[pix_idx] -= img_pyramid.octaves[i][j-1].data[pix_idx];
             }
-            dog_pyramid.octaves[i][j-1] = std::move(diff);
+            dog_pyramid.octaves[i].push_back(diff);
         }
     }
     return dog_pyramid;
@@ -222,31 +401,30 @@ bool refine_or_discard_keypoint(Keypoint& kp, const std::vector<Image>& octave,
 }
 
 std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, float contrast_thresh,
-                                     float edge_thresh)
+                                     float edge_thresh, int world_rank, int world_size)
 {
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-    
     std::vector<Keypoint> keypoints;
-    
-    #pragma omp parallel
-    {
-        std::vector<Keypoint> local_keypoints;
-        
-        // Distribute octaves among MPI processes
-        #pragma omp for collapse(2) schedule(dynamic)
-        for (int i = 0; i < dog_pyramid.num_octaves; i++) {
-            for (int j = 1; j < dog_pyramid.imgs_per_octave - 1; j++) {
-                // Only process if this octave belongs to this MPI rank
-                if (i % size != rank) continue;
-                
-                const std::vector<Image>& octave = dog_pyramid.octaves[i];
-                const Image& img = octave[j];
-                
-                for (int x = 1; x < img.width - 1; x++) {
-                    for (int y = 1; y < img.height - 1; y++) {
-                        if (std::abs(img.get_pixel(x, y, 0)) < 0.8 * contrast_thresh) {
+    for (int i = 0; i < dog_pyramid.num_octaves; i++) {
+        const std::vector<Image>& octave = dog_pyramid.octaves[i];
+        for (int j = 1; j < dog_pyramid.imgs_per_octave-1; j++) {
+            const Image& img = octave[j];
+            int x_begin = 1;
+            int x_end = img.width - 1;
+            compute_partition_bounds(img.width, world_rank, world_size, x_begin, x_end);
+            if (x_begin >= x_end) {
+                continue;
+            }
+#ifdef _OPENMP
+            int thread_count = omp_get_max_threads();
+            std::vector<std::vector<Keypoint>> thread_local_keypoints(thread_count);
+#pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
+                std::vector<Keypoint>& local = thread_local_keypoints[tid];
+#pragma omp for schedule(dynamic, 4)
+                for (int x = x_begin; x < x_end; ++x) {
+                    for (int y = 1; y < img.height-1; ++y) {
+                        if (std::abs(img.get_pixel(x, y, 0)) < 0.8f * contrast_thresh) {
                             continue;
                         }
                         if (point_is_extremum(octave, j, x, y)) {
@@ -254,53 +432,35 @@ std::vector<Keypoint> find_keypoints(const ScaleSpacePyramid& dog_pyramid, float
                             bool kp_is_valid = refine_or_discard_keypoint(kp, octave, contrast_thresh,
                                                                           edge_thresh);
                             if (kp_is_valid) {
-                                local_keypoints.push_back(kp);
+                                local.push_back(kp);
                             }
                         }
                     }
                 }
             }
-        }
-        
-        #pragma omp critical
-        keypoints.insert(keypoints.end(), local_keypoints.begin(), local_keypoints.end());
-    }
-    
-    // Gather keypoints from all processes to rank 0
-    if (size > 1) {
-        int local_count = keypoints.size();
-        std::vector<int> all_counts;
-        
-        if (rank == 0) {
-            all_counts.resize(size);
-        }
-        
-        MPI_Gather(&local_count, 1, MPI_INT, all_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
-        
-        std::vector<Keypoint> all_keypoints;
-        if (rank == 0) {
-            all_keypoints = keypoints;
-            
-            for (int src = 1; src < size; src++) {
-                if (all_counts[src] > 0) {
-                    std::vector<Keypoint> recv_kps(all_counts[src]);
-                    MPI_Recv(recv_kps.data(), all_counts[src] * sizeof(Keypoint), MPI_BYTE, 
-                            src, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    all_keypoints.insert(all_keypoints.end(), recv_kps.begin(), recv_kps.end());
+            for (auto& local_vec : thread_local_keypoints) {
+                keypoints.insert(keypoints.end(), local_vec.begin(), local_vec.end());
+            }
+#else
+            for (int x = x_begin; x < x_end; ++x) {
+                for (int y = 1; y < img.height-1; ++y) {
+                    if (std::abs(img.get_pixel(x, y, 0)) < 0.8f * contrast_thresh) {
+                        continue;
+                    }
+                    if (point_is_extremum(octave, j, x, y)) {
+                        Keypoint kp = {x, y, i, j, -1, -1, -1, -1};
+                        bool kp_is_valid = refine_or_discard_keypoint(kp, octave, contrast_thresh,
+                                                                      edge_thresh);
+                        if (kp_is_valid) {
+                            keypoints.push_back(kp);
+                        }
+                    }
                 }
             }
-            
-            return all_keypoints;
-        } else {
-            if (local_count > 0) {
-                MPI_Send(keypoints.data(), local_count * sizeof(Keypoint), MPI_BYTE, 
-                        0, 0, MPI_COMM_WORLD);
-            }
-            return std::vector<Keypoint>();  // Non-root returns empty
-        }
-    }
-    
-    return keypoints;
+#endif
+         }
+     }
+     return keypoints;
 }
 
 // calculate x and y derivatives for all images in the input pyramid
@@ -311,34 +471,28 @@ ScaleSpacePyramid generate_gradient_pyramid(const ScaleSpacePyramid& pyramid)
         pyramid.imgs_per_octave,
         std::vector<std::vector<Image>>(pyramid.num_octaves)
     };
-
     for (int i = 0; i < pyramid.num_octaves; i++) {
-        grad_pyramid.octaves[i].resize(pyramid.imgs_per_octave);
-    }
-
-    #pragma omp parallel for collapse(2) schedule(dynamic)
-    for (int i = 0; i < pyramid.num_octaves; i++) {
+        grad_pyramid.octaves[i].reserve(grad_pyramid.imgs_per_octave);
+        int width = pyramid.octaves[i][0].width;
+        int height = pyramid.octaves[i][0].height;
         for (int j = 0; j < pyramid.imgs_per_octave; j++) {
-            int width = pyramid.octaves[i][0].width;
-            int height = pyramid.octaves[i][0].height;
             Image grad(width, height, 2);
-            float gx, gy;
-
-            for (int x = 1; x < grad.width-1; x++) {
-                for (int y = 1; y < grad.height-1; y++) {
-                    gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+            for (int y = 1; y < grad.height-1; y++) {
+                for (int x = 1; x < grad.width-1; x++) {
+                    float gx = (pyramid.octaves[i][j].get_pixel(x+1, y, 0)
                          -pyramid.octaves[i][j].get_pixel(x-1, y, 0)) * 0.5;
                     grad.set_pixel(x, y, 0, gx);
-                    gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
+                    float gy = (pyramid.octaves[i][j].get_pixel(x, y+1, 0)
                          -pyramid.octaves[i][j].get_pixel(x, y-1, 0)) * 0.5;
                     grad.set_pixel(x, y, 1, gy);
                 }
             }
-
-            grad_pyramid.octaves[i][j] = std::move(grad);
+            grad_pyramid.octaves[i].push_back(grad);
         }
     }
-
     return grad_pyramid;
 }
 
@@ -513,52 +667,91 @@ void compute_keypoint_descriptor(Keypoint& kp, float theta,
     hists_to_vec(histograms, kp.descriptor);
 }
 
-std::vector<Keypoint> find_keypoints_and_descriptors(const Image& img, float sigma_min,
-                                                     int num_octaves, int scales_per_octave, 
-                                                     float contrast_thresh, float edge_thresh, 
-                                                     float lambda_ori, float lambda_desc)
+std::vector<Keypoint> find_keypoints_and_descriptors_parallel(const Image& img, MPI_Comm comm,
+                                                              float sigma_min, int num_octaves,
+                                                              int scales_per_octave,
+                                                              float contrast_thresh,
+                                                              float edge_thresh,
+                                                              float lambda_ori,
+                                                              float lambda_desc)
 {
-    assert(img.channels == 1 || img.channels == 3);
+    int world_rank = 0;
+    int world_size = 1;
+    MPI_Comm_rank(comm, &world_rank);
+    MPI_Comm_size(comm, &world_size);
 
-    int rank;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    const int root = 0;
+    ScaleSpacePyramid dog_pyramid;
+    ScaleSpacePyramid grad_pyramid;
 
-    const Image& input = img.channels == 1 ? img : rgb_to_grayscale(img);
-    ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid(input, sigma_min, num_octaves,
-                                                                   scales_per_octave);
-    ScaleSpacePyramid dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
-    std::vector<Keypoint> tmp_kps = find_keypoints(dog_pyramid, contrast_thresh, edge_thresh);
-    
-    // Only rank 0 continues with descriptor computation
-    if (rank != 0) {
-        return std::vector<Keypoint>();
+    if (world_rank == root) {
+        ScaleSpacePyramid gaussian_pyramid = generate_gaussian_pyramid(
+            img, sigma_min, num_octaves, scales_per_octave);
+        dog_pyramid = generate_dog_pyramid(gaussian_pyramid);
+        grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
     }
 
-    ScaleSpacePyramid grad_pyramid = generate_gradient_pyramid(gaussian_pyramid);
-    
-    std::vector<Keypoint> kps;
+    broadcast_pyramid(dog_pyramid, root, comm);
+    broadcast_pyramid(grad_pyramid, root, comm);
 
-    #pragma omp parallel
-    {
-        std::vector<Keypoint> local_kps;
-        
-        #pragma omp for schedule(dynamic)
-        for (size_t idx = 0; idx < tmp_kps.size(); idx++) {
-            Keypoint& kp_tmp = tmp_kps[idx];
-            std::vector<float> orientations = find_keypoint_orientations(kp_tmp, grad_pyramid,
-                                                                         lambda_ori, lambda_desc);
-            for (float theta : orientations) {
-                Keypoint kp = kp_tmp;
-                compute_keypoint_descriptor(kp, theta, grad_pyramid, lambda_desc);
-                local_kps.push_back(kp);
-            }
+    std::vector<Keypoint> local_kps = compute_keypoints_from_pyramids(
+        dog_pyramid, grad_pyramid,
+        contrast_thresh, edge_thresh, lambda_ori, lambda_desc,
+        world_rank, world_size);
+
+    int local_count = static_cast<int>(local_kps.size());
+    std::vector<PackedKeypoint> packed(local_kps.size());
+    for (int idx = 0; idx < local_count; ++idx) {
+        packed[idx] = pack_keypoint(local_kps[idx]);
+    }
+
+    std::vector<int> counts;
+    if (world_rank == root) {
+        counts.resize(world_size);
+    }
+    MPI_Gather(&local_count, 1, MPI_INT,
+               world_rank == root ? counts.data() : nullptr,
+               1, MPI_INT, root, comm);
+
+    int send_bytes = local_count * static_cast<int>(sizeof(PackedKeypoint));
+
+    std::vector<int> counts_bytes;
+    std::vector<int> displs_bytes;
+    std::vector<PackedKeypoint> recv_buf;
+    PackedKeypoint* recv_ptr = nullptr;
+    if (world_rank == root) {
+        counts_bytes.resize(world_size);
+        displs_bytes.resize(world_size);
+        int total_bytes = 0;
+        for (int i = 0; i < world_size; ++i) {
+            counts_bytes[i] = counts[i] * static_cast<int>(sizeof(PackedKeypoint));
+            displs_bytes[i] = total_bytes;
+            total_bytes += counts_bytes[i];
         }
-        
-        #pragma omp critical
-        kps.insert(kps.end(), local_kps.begin(), local_kps.end());
+        int recv_count = total_bytes / static_cast<int>(sizeof(PackedKeypoint));
+        recv_buf.resize(recv_count);
+        if (!recv_buf.empty()) {
+            recv_ptr = recv_buf.data();
+        }
     }
-    
-    return kps;
+
+    MPI_Gatherv(packed.empty() ? nullptr : packed.data(),
+                send_bytes,
+                MPI_BYTE,
+                recv_ptr,
+                world_rank == root ? counts_bytes.data() : nullptr,
+                world_rank == root ? displs_bytes.data() : nullptr,
+                MPI_BYTE, root, comm);
+
+    if (world_rank == root) {
+        std::vector<Keypoint> global_kps;
+        global_kps.reserve(recv_buf.size());
+        for (const auto& pk : recv_buf) {
+            global_kps.push_back(unpack_keypoint(pk));
+        }
+        return global_kps;
+    }
+    return {};
 }
 
 float euclidean_dist(std::array<uint8_t, 128>& a, std::array<uint8_t, 128>& b)
